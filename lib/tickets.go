@@ -1,5 +1,7 @@
 package lib
 
+import "fmt"
+
 type tickets struct {
 	active bool
 	total  uint32
@@ -26,21 +28,31 @@ func (t *tickets) Init() {
 }
 
 func (t *tickets) Put() {
+	fmt.Println("put back !!!")
 	t.pool <- struct{}{}
 }
 
-func (t *tickets) Get() {
-	_ <- t.pool
+func (t *tickets) Get() bool {
+	_, ok := <-t.pool
+	return ok
 }
 
-func (t *tickets) Active() bool {
+/*func (t *tickets) Active() bool {
 	return t.active
 }
-
+*/
 func (t *tickets) Total() uint32 {
 	return t.total
 }
 
 func (t *tickets) Remainder() uint32 {
 	return uint32(len(t.pool))
+}
+
+func (t *tickets) Close() {
+	if t.active == false {
+		return
+	}
+	close(t.pool)
+	t.active = false
 }

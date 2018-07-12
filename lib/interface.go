@@ -2,7 +2,6 @@ package lib
 
 import "time"
 
-
 const (
 	STATUS_ORIGIN    uint32 = iota
 	STATUS_STARTTING
@@ -15,7 +14,7 @@ type LoadGenerator interface {
 	Start() bool
 
 	// Stop stops the generator
-	Stop() bool
+	Stop()
 
 	Status() uint32
 
@@ -30,6 +29,7 @@ type Caller interface {
 
 	CheckResp(req RawReq, resp RawResp) bool
 }
+
 /*
 type RawReq interface {
 	ID() uint64
@@ -53,12 +53,12 @@ type RawResp interface {
 type Tickets interface {
 	Init()
 	Put()
-	Get()
-	Active() bool
+	Get() bool
+	//Active() bool
 	Total() uint32
 	Remainder() uint32
+	Close()
 }
-
 
 type Result struct {
 	ID     int32
@@ -74,6 +74,9 @@ type RawReq struct {
 	req []byte
 }
 
+func NewReq(id int32, req []byte) RawReq {
+	return RawReq{id, req}
+}
 
 type RawResp struct {
 	id  int32
@@ -81,3 +84,10 @@ type RawResp struct {
 	err error
 }
 
+func NewResp(id int32, res []byte, err error) RawResp {
+	return RawResp{
+		id,
+		res,
+		err,
+	}
+}
