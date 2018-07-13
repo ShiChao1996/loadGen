@@ -9,13 +9,9 @@ import (
 	"time"
 	"sync/atomic"
 	"context"
-	"log"
 	"fmt"
-	"errors"
 	"os"
 )
-
-var logger = log.Logger{}
 
 type generator struct {
 	// loads per second
@@ -53,8 +49,6 @@ func (g *generator) Start() bool {
 	if ok := atomic.CompareAndSwapUint32(&g.status, STATUS_ORIGIN, STATUS_STARTTING); !ok {
 		return false
 	}
-	g.tickets.Init()
-	g.callCount = 0
 	g.ctx, g.cancelFunc = context.WithTimeout(context.Background(), g.duration)
 
 	go g.genLoad()
@@ -112,46 +106,82 @@ func (g *generator) stopGraceful() {
 
 func (g *generator) callOne() {
 	var (
-		result *Result
-		req    RawReq
+		callStatus = STATUS_UNCALL
+		result     *Result
+		req        = g.caller.BuildReq()
 	)
 
 	defer func() {
 		g.tickets.Put()
 		if err := recover(); err != nil {
+			fmt.Println("errrrr: ", err)
 			result = &Result{
-				ID:  req.id,
-				Req: req,
-				Resp: RawResp{
-					id:  req.id,
-					res: nil,
-					err: errors.New("call func crashed"),
-				},
+				ID:     0,
+				Req:    req,
+				Resp:   nil,
+				Code:   RET_CODE_FATAL_CALL,
+				Msg:    "call fetal error",
 				Elapse: 0,
 			}
 			g.sendResult(result)
 		}
 	}()
 
-	caller := g.caller
-	req = caller.BuildReq()
+	timer := time.AfterFunc(g.timeout, func() {
+		if !atomic.CompareAndSwapUint32(&callStatus, STATUS_UNCALL, STATUS_CALLED) {
+			return
+		}
+		result = &Result{
+			ID:     req.ID,
+			Req:    req,
+			Resp:   nil,
+			Code:   RET_CODE_WARNING_CALL_TIMEOUT,
+			Msg:    "call did not receive response until timeout",
+			Elapse: g.timeout,
+		}
+		g.sendResult(result)
+	})
 
-	start := time.Now().Nanosecond()
-	resp, err := caller.Call(req.req)
-	end := time.Now().Nanosecond()
+	resp := g.doCallOne(req.Req, &callStatus)
+	if !atomic.CompareAndSwapUint32(&callStatus, STATUS_UNCALL, STATUS_CALLED) {
+		return
+	}
+	timer.Stop()
 
-	result = &Result{
-		ID:  req.id,
-		Req: req,
-		Resp: RawResp{
-			id:  req.id,
-			res: resp,
-			err: err,
-		},
-		Elapse: time.Duration(end - start),
+	if resp.Err != nil {
+		result = &Result{
+			ID:     req.ID,
+			Req:    req,
+			Resp:   resp,
+			Code:   RET_CODE_ERROR_CALL,
+			Msg:    "call error",
+			Elapse: resp.Elapse,
+		}
+	} else {
+		result = &Result{
+			ID:     req.ID,
+			Req:    req,
+			Resp:   resp,
+			Code:   RET_CODE_SUCCESS,
+			Msg:    "call success",
+			Elapse: resp.Elapse,
+		}
 	}
 
 	g.sendResult(result)
+}
+
+func (g *generator) doCallOne(req []byte, callStatus *uint32) (res *RawResp) {
+	start := time.Now().Nanosecond()
+	resp, err := g.caller.Call(req)
+	end := time.Now().Nanosecond()
+
+	atomic.AddUint32(&g.callCount, 1)
+	return &RawResp{
+		Resp:   resp,
+		Err:    err,
+		Elapse: time.Duration(end - start),
+	}
 }
 
 func (g *generator) sendResult(res *Result) bool {
