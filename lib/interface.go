@@ -1,3 +1,8 @@
+/*
+ * Revision History:
+ *     Initial: 2018/7/03        ShiChao
+ */
+
 package lib
 
 import "time"
@@ -6,6 +11,7 @@ const (
 	STATUS_ORIGIN    uint32 = iota
 	STATUS_STARTTING
 	STATUS_STARTTED
+	STATUS_STOPPING
 	STATUS_STOPPED
 )
 
@@ -13,13 +19,16 @@ type LoadGenerator interface {
 	// Start start to generator load
 	Start() bool
 
-	// Stop stops the generator
+	// Stop this will be invoked when actively stop the generator or unexpectedly. see signal. you can collection some resource before exit.
 	Stop()
 
 	Status() uint32
 
 	// CallCount returns number of calls
 	CallCount() uint32
+
+	// BeforeStop this will be called while program exit invalidly
+	BeforeExit(fn func())
 }
 
 type Caller interface {

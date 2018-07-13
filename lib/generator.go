@@ -1,3 +1,8 @@
+/*
+ * Revision History:
+ *     Initial: 2018/7/04        ShiChao
+ */
+
 package lib
 
 import (
@@ -6,39 +11,41 @@ import (
 	"context"
 	"log"
 	"fmt"
+	"errors"
+	"os"
 )
 
 var logger = log.Logger{}
 
 type generator struct {
 	// loads per second
-	lps         uint32
-	callCount   uint32
-	concurrency uint32
-	status      uint32
-
-	ctx        context.Context
-	cancelFunc context.CancelFunc
-	timeout    time.Duration
-	duration   time.Duration
-	tickets    Tickets
-	caller     Caller
-	resultCh   chan *Result
-	waitStatis chan struct{} // wait for statistic
+	lps       uint32
+	callCount uint32
+	// concurrency: single call response time div interval to send request
+	concurrency     uint32
+	status          uint32
+	ctx             context.Context
+	cancelFunc      context.CancelFunc
+	timeout         time.Duration // single request max time, this is used to estimate the concurrency
+	duration        time.Duration
+	tickets         Tickets
+	caller          Caller
+	resultCh        chan *Result
+	signals         chan os.Signal
+	beforeStopFuncs []func()
 }
 
-func NewGen(caller Caller, timeout time.Duration, lps uint32, duration time.Duration) LoadGenerator {
+func NewGen(caller Caller, timeout time.Duration, lps uint32, duration time.Duration, resultCh chan *Result) LoadGenerator {
 	g := &generator{
-		lps:        lps,
-		caller:     caller,
-		timeout:    timeout,
-		duration:   duration,
-		waitStatis: make(chan struct{}),
-		//resultCh: make(chan *Result, ), //todo:use cached channel
+		lps:      lps,
+		caller:   caller,
+		timeout:  timeout,
+		duration: duration,
+		resultCh: resultCh, // note: this should be passed in by user because the genLoad should not handle the result,just keep it simple.
+		signals:  make(chan os.Signal),
 	}
-	g.concurrency = uint32(timeout) / (1e9 / lps)
+	g.concurrency = uint32(timeout) / (1e9 / lps) // note: = lps * second
 	g.tickets = NewTickets(g.concurrency)
-	g.resultCh = make(chan *Result, g.concurrency)
 	return g
 }
 
@@ -49,45 +56,17 @@ func (g *generator) Start() bool {
 	g.tickets.Init()
 	g.callCount = 0
 	g.ctx, g.cancelFunc = context.WithTimeout(context.Background(), g.duration)
-	ticker := time.NewTicker(time.Duration(1e9 / g.lps))
 
-	go func() {
-		count := 0
-		for {
-			select {
-			case <-g.ctx.Done():
-				{
-					fmt.Printf("use %d goroutines", count)
-					return // todo: gracefully stop
-				}
-			default:
-			}
+	go g.genLoad()
+	g.configureSignals()
+	go g.listenSignals()
 
-			// g.tickets.Get() note: shouldn't be here, if it blocks, never get done from the loop
-			if ok := g.tickets.Get(); ok { // note: when we want to stop it, we close the channel, then it can run along, but shouldn't setup a new goroutine
-				go g.call(ticker)
-				count++
-			}
-		}
-	}()
-
-	go g.statistic()
-	g.wait()
-	a := make(chan int)
-	a <- 0
 	return true
 }
 
 func (g *generator) Stop() {
-	if atomic.SwapUint32(&g.status, STATUS_STOPPED) == STATUS_STOPPED {
-		logger.Println("already closed !")
-		return
-	}
-
-	g.tickets.Close()
 	g.cancelFunc()
-	close(g.resultCh)
-
+	g.stopGraceful()
 }
 
 func (g *generator) Status() uint32 {
@@ -98,33 +77,69 @@ func (g *generator) CallCount() uint32 {
 	return atomic.LoadUint32(&g.callCount)
 }
 
-func (g *generator) call(ticker *time.Ticker) {
-	defer func() {
-		g.tickets.Put()
-	}()
+func (g *generator) BeforeExit(fn func()) {
+	if fn == nil {
+		fmt.Println("fn should not be nil")
+		return
+	}
+	g.beforeStopFuncs = append(g.beforeStopFuncs, fn)
+}
+
+func (g *generator) genLoad() {
+	ticker := time.NewTicker(time.Duration(1e9 / g.lps))
+	go g.callOne() // note: immediately invoke one
 	for {
 		select {
 		case <-g.ctx.Done():
+			g.stopGraceful()
 			return
 		case <-ticker.C:
+			g.tickets.Get()
+			if atomic.LoadUint32(&g.status) == STATUS_STOPPED {
+				return // note: in case that g.ctx timeout while waiting for tickets.And remember close tickets channel after timeout, or not it may block here for time.
+			}
 			go g.callOne()
 		}
 	}
 }
 
-func (g *generator) callOne() {
-	defer func() {
-		if err := recover(); err != nil {
+func (g *generator) stopGraceful() {
+	atomic.CompareAndSwapUint32(&g.status, STATUS_STARTTED, STATUS_STOPPING)
+	fmt.Println("closing the result channel...")
+	close(g.resultCh)
+	atomic.StoreUint32(&g.status, STATUS_STOPPED)
+}
 
+func (g *generator) callOne() {
+	var (
+		result *Result
+		req    RawReq
+	)
+
+	defer func() {
+		g.tickets.Put()
+		if err := recover(); err != nil {
+			result = &Result{
+				ID:  req.id,
+				Req: req,
+				Resp: RawResp{
+					id:  req.id,
+					res: nil,
+					err: errors.New("call func crashed"),
+				},
+				Elapse: 0,
+			}
+			g.sendResult(result)
 		}
 	}()
 
-	var result *Result
 	caller := g.caller
-	req := caller.BuildReq()
+	req = caller.BuildReq()
+
 	start := time.Now().Nanosecond()
 	resp, err := caller.Call(req.req)
 	end := time.Now().Nanosecond()
+
 	result = &Result{
 		ID:  req.id,
 		Req: req,
@@ -136,39 +151,18 @@ func (g *generator) callOne() {
 		Elapse: time.Duration(end - start),
 	}
 
-	g.resultCh <- result
-
+	g.sendResult(result)
 }
 
-func (g *generator) statistic() {
-	var (
-		count       uint64 = 0
-		minElapse   time.Duration
-		maxElapse   time.Duration
-		totalElapse time.Duration = 0
-	)
-	firstRes := <-g.resultCh
-	minElapse = firstRes.Elapse
-	totalElapse = firstRes.Elapse
-	count++
-	for result := range g.resultCh {
-		if minElapse > result.Elapse {
-			minElapse = result.Elapse
-		}
-		if maxElapse < result.Elapse {
-			maxElapse = result.Elapse
-		}
-		totalElapse += result.Elapse
-		count ++
+func (g *generator) sendResult(res *Result) bool {
+	if atomic.LoadUint32(&g.status) == STATUS_STOPPED {
+		return false
 	}
-	averageElapse := uint64(totalElapse) / count
-	fmt.Printf("total calls: %d \n minElapse: %d \n maxElapse: %d \n averageElapse: %d \n", count, minElapse, maxElapse, averageElapse)
-	g.waitStatis <- struct{}{}
-}
-
-func (g *generator) wait() {
-	<-g.ctx.Done()
-	close(g.resultCh)
-	<-g.waitStatis
-
+	select {
+	case g.resultCh <- res:
+		return true
+	default:
+		fmt.Printf("Ingnore one result : %v\n", res)
+		return false
+	}
 }

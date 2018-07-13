@@ -1,4 +1,9 @@
-package lib
+/*
+ * Revision History:
+ *     Initial: 2018/7/04        ShiChao
+ */
+
+ package lib
 
 import "fmt"
 
